@@ -10,3 +10,6 @@ data/
 dist/
 results-parsed/
 results-raw/
+scraper.db*
+/users.csv
+/tweets.csv
