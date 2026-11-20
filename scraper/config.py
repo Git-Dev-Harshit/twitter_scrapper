@@ -29,6 +29,10 @@ class Config:
     # "rotate" picks the least recently used combination every session
     pairing: Pairing = "sticky"
     max_accounts_per_proxy: int = 2
+    # sticky: the account logs in and scrapes only through its home proxy. When that proxy
+    # is down the account waits for it; re-run add-accounts to move it to another proxy.
+    # False lets an account move to a free proxy on its own when its home proxy fails.
+    pin_home_proxy: bool = True
 
     # account failures
     error_cooldown_minutes: float = 5.0

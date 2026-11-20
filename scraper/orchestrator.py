@@ -1,14 +1,17 @@
 """Leases (account, proxy, job) triples to workers, applies session outcomes, runs health checks."""
 
 import asyncio
+import os
 import random
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from urllib.parse import urlparse
 
-from twscrape import AccountsPool, NoAccountError
+from twscrape import AccountsPool, HttpStatusError, NoAccountError
 from twscrape.logger import logger
+from twscrape.login import LoginConfig
+from twscrape.login import login as tw_login
 from twscrape.utils import parse_proxy
 
 from .config import Config
@@ -19,12 +22,13 @@ from .policy import (
     breaker_tripped,
     choose_pair,
     jitter,
+    pick_home,
     proxies_to_probe,
     proxy_after,
     proxy_after_probe,
     proxy_available,
 )
-from .store import AccountState, Store
+from .store import AccountState, ProxyState, Store
 from .worker import (
     ApiFactory,
     Lease,
@@ -45,6 +49,10 @@ def mask_proxy(url: str | None) -> str:
         return "-"
     parsed = urlparse(parse_proxy(url) or url)
     return f"{parsed.hostname}:{parsed.port}" if parsed.hostname else "?"
+
+
+def same_proxy(a: str, b: str) -> bool:
+    return parse_proxy(a) == parse_proxy(b)
 
 
 class Orchestrator:
@@ -78,10 +86,19 @@ class Orchestrator:
 
     async def sync_accounts(self) -> None:
         now = self.clock()
+        proxies = await self.store.proxies()
         for acc in await self.pool.get_all():
             await self.store.ensure_account(acc.username)
             state = await self.store.account(acc.username)
-            if state is None or state.in_use or state.status != "healthy" or acc.active:
+            if state is None or state.in_use:
+                continue
+            if state.home_proxy is None and acc.proxy:
+                # added through the twscrape CLI with a proxy: make that proxy its home
+                match = next((p for p in proxies if same_proxy(p.url, acc.proxy)), None)
+                if match is not None:
+                    state = replace(state, home_proxy=match.url)
+                    await self.store.save_account(state)
+            if state.status != "healthy" or acc.active:
                 continue
             # twscrape deactivated it (e.g. in another process): adopt its verdict
             outcome, _ = classify_account(acc, "", now)
@@ -92,6 +109,133 @@ class Orchestrator:
                 replace(new, sessions=state.sessions, last_used=state.last_used)
             )
             logger.warning(f"Account {acc.username} is inactive in twscrape: {new.status}")
+
+    # onboarding: every account gets a home proxy before its first request, and logs in,
+    # stores cookies and scrapes through that same proxy
+
+    async def assign_home(self, username: str) -> ProxyState | None:
+        """Keep the account's home proxy if it still works, else move it to a new one.
+
+        Every candidate is probed first; a proxy that fails the probe is benched and the
+        next best one is tried.
+        """
+        tried: set[str] = set()
+        while True:
+            async with self._lock:
+                await self.store.ensure_account(username)
+                state = await self.store.account(username)
+                proxies = await self.store.proxies()
+                home = next((p for p in proxies if p.url == (state and state.home_proxy)), None)
+                if home is not None and home.status != "dead" and home.url not in tried:
+                    cand: ProxyState | None = home
+                else:
+                    cand = pick_home(
+                        username,
+                        await self.store.accounts(),
+                        [p for p in proxies if p.status == "healthy" and p.url not in tried],
+                        await self.store.pair_history(),
+                        self.cfg,
+                        self.rng,
+                    )
+            if cand is None:
+                return None
+
+            tried.add(cand.url)
+            r = await self.probe(cand.url)
+            async with self._lock:
+                now = self.clock()
+                fresh = next((p for p in await self.store.proxies() if p.url == cand.url), cand)
+                fresh = proxy_after_probe(
+                    fresh, r.ok, self.cfg, now, r.latency_ms, r.exit_ip, r.error
+                )
+                await self.store.save_proxy(fresh)
+                if r.ok:
+                    state = await self.store.account(username)
+                    if state is not None and state.home_proxy != cand.url:
+                        detail = f"{mask_proxy(state.home_proxy)} -> {mask_proxy(cand.url)}"
+                        await self.store.log_event(now, "rebind", username, detail)
+                        await self.store.save_account(replace(state, home_proxy=cand.url))
+                    return fresh
+            logger.warning(
+                f"Proxy {mask_proxy(cand.url)} failed its probe ({r.error}), trying another"
+            )
+
+    async def _ready(self, username: str, proxy_url: str) -> None:
+        """Point twscrape at the home proxy too, and clear an 'expired' state."""
+        acc = await self.pool.get(username)
+        if acc.proxy != proxy_url:
+            acc.proxy = proxy_url
+            await self.pool.save(acc)
+        state = await self.store.account(username)
+        if state is not None and state.status == "expired":
+            await self.store.save_account(replace(state, status="healthy", last_error=None))
+
+    async def add_cookie_account(self, username: str, cookies: str) -> ProxyState:
+        proxy = await self.assign_home(username)
+        if proxy is None:
+            raise RuntimeError("no working proxy available, add proxies or check-proxies")
+        await self.pool.add_account_cookies(username, cookies)
+        await self._ready(username, proxy.url)
+        return proxy
+
+    async def login_account(
+        self,
+        username: str,
+        password: str,
+        email: str,
+        email_password: str,
+        mfa_secret: str | None = None,
+        manual: bool = False,
+        force: bool = False,
+    ) -> tuple[bool, str]:
+        """Log in through the account's home proxy; twscrape stores the session cookies."""
+        if os.getenv("TWS_PROXY"):
+            return False, "unset TWS_PROXY first: it overrides the account's home proxy"
+
+        proxy = await self.assign_home(username)
+        if proxy is None:
+            return False, "no working proxy available, add proxies or check-proxies"
+
+        acc = await self.pool.get_account(username)
+        if acc is None:
+            await self.pool.add_account(
+                username, password, email, email_password, proxy=proxy.url, mfa_code=mfa_secret
+            )
+            acc = await self.pool.get(username)
+
+        moved = acc.proxy != proxy.url
+        acc.password, acc.email, acc.email_password = password, email, email_password
+        acc.mfa_code = mfa_secret or acc.mfa_code
+        acc.proxy = proxy.url
+        if acc.active and acc.has_session and not moved and not force:
+            await self.pool.save(acc)
+            await self._ready(username, proxy.url)
+            return True, f"already logged in via {mask_proxy(proxy.url)}"
+
+        # a new or moved session: log in again so cookies and IP belong together
+        acc.active, acc.cookies, acc.headers, acc.locks, acc.error_msg = False, {}, {}, {}, None
+        manual = manual or email_password in ("", "_")
+        try:
+            await tw_login(acc, cfg=LoginConfig(manual=manual))
+            ok, msg = True, f"logged in via {mask_proxy(proxy.url)}"
+        except HttpStatusError as e:
+            ok, msg = False, f"HTTP {e.response.status_code}: {e.response.text[:150]}"
+        except Exception as e:
+            ok, msg = False, f"{type(e).__name__}: {e}"[:200]
+
+        if not ok:
+            acc.active, acc.error_msg = False, f"login failed: {msg}"
+        await self.pool.save(acc)
+
+        if ok:
+            await self._ready(username, proxy.url)
+        else:
+            state = await self.store.account(username)
+            if state is not None and state.status == "healthy":
+                await self.store.save_account(
+                    replace(state, status="expired", last_error=acc.error_msg)
+                )
+        return ok, msg
 
     # leasing
 

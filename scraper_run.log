@@ -1,0 +1,4 @@
+[32m2026-11-20 20:47:31.726[0m | [1mINFO    [0m | [36mscraper.orchestrator[0m:[36m_worker[0m:[36m453[0m - [1m[w0] session 3: ta9reh via 69.91.142.40:7532 on search:rent lang:en include:nativeretweets[0m
+[32m2026-11-20 20:53:03.137[0m | [1mINFO    [0m | [36mscraper.orchestrator[0m:[36m_worker[0m:[36m473[0m - [1m[w0] session 3 ended: ok, 27 pages, 535 new items[0m
+[32m2026-11-20 21:28:46.921[0m | [1mINFO    [0m | [36mscraper.orchestrator[0m:[36m_worker[0m:[36m453[0m - [1m[w1] session 4: ta9reh via 69.91.142.40:7532 on search:idle lang:en include:nativeretweets[0m
+[32m2026-11-20 21:33:39.578[0m | [1mINFO    [0m | [36mscraper.orchestrator[0m:[36m_worker[0m:[36m473[0m - [1m[w1] session 4 ended: ok, 24 pages, 475 new items[0m

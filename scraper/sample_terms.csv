@@ -1,8 +1,31 @@
 hashtag,keywords
-#buildinpublic,indie hacker
-#saas,looking for a cofounder
-#startup #founder,"""need a developer"""
-nocode,rust OR golang
-#webdev,
-,hiring remote -filter:replies
-#AI,
+#GPU,rent
+#GPU,idle
+#GPU,for rent
+#GPU,hosting
+#GPU,provider
+#GPU,expensive
+#GPUrental,provider
+#GPUrental,looking
+#GPUcloud,alternative
+#GPUcloud,pricing
+#GPUmining,unprofitable
+#GPUmining,AI
+#DePIN,GPU
+#DePIN,compute
+#AICompute,provider
+#AICompute,shortage
+#AICompute,affordable
+#AIInfrastructure,GPU
+#LocalLLM,multi GPU
+#LocalLLM,hosting
+#StableDiffusion,cloud GPU
+#StableDiffusion,rent GPU
+#ComfyUI,cloud GPU
+#datacenter,GPU hosting
+#datacenter,colocation
+#RTX4090,rent
+#RTX5090,rent
+#H100,rental
+#H200,rental
+#B200,rental

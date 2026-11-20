@@ -4,12 +4,13 @@ import argparse
 import asyncio
 import contextlib
 import csv
+import sys
 import time
 from pathlib import Path
 
 from twscrape import AccountsPool
-from twscrape.utils import parse_cookies
 
+from .accounts_file import read_accounts
 from .config import Config
 from .orchestrator import Orchestrator, mask_proxy
 from .store import Store
@@ -47,27 +48,74 @@ async def cmd_add_proxies(cfg: Config, args: argparse.Namespace) -> None:
 
 
 async def cmd_add_accounts(cfg: Config, args: argparse.Namespace) -> None:
-    """Lines: username|cookies  (cookies as 'auth_token=..; ct0=..', JSON, or base64)."""
-    pool = AccountsPool(cfg.accounts_db)
+    """Add/login accounts from a file (see scraper/accounts_file.py for the formats).
+
+    Each account first gets a home proxy (probed), then is added or logged in through it.
+    """
+    records = read_accounts(args.file)
+    if not records:
+        print("No accounts found in file")
+        return
+
     async with Store(cfg.data_db) as store:
-        for line in _read_lines(args.file):
-            username, sep, cookies = line.partition("|")
-            if not sep:
-                print(f"Skipped (expected username|cookies): {username[:20]}")
+        if not await store.proxies():
+            print("No proxies yet: run add-proxies first, accounts log in through them")
+            return
+
+        orc = Orchestrator(cfg, store)
+        for rec, raw in records:
+            if rec is None:
+                print(f"{raw[:20]:20s} skipped: unrecognized line format")
                 continue
-            username = username.strip().lstrip("@")
-            try:
-                parse_cookies(cookies.strip())
-                await pool.add_account_cookies(username, cookies.strip())
-            except ValueError as e:
-                print(f"Skipped {username}: {e}")
-                continue
-            # fresh cookies end an 'expired' state; a banned account needs `revive`
-            state = await store.account(username)
-            await store.ensure_account(
-                username, reset=state is not None and state.status == "expired"
-            )
-            print(f"Account {username} ready")
+
+            if rec.kind == "cookies":
+                try:
+                    proxy = await orc.add_cookie_account(rec.username, rec.cookies or "")
+                except (ValueError, RuntimeError) as e:
+                    print(f"{rec.username:20s} skipped: {e}")
+                    continue
+                print(f"{rec.username:20s} cookies saved, home proxy {mask_proxy(proxy.url)}")
+            else:
+                ok, msg = await orc.login_account(
+                    rec.username,
+                    rec.password or "",
+                    rec.email or "",
+                    rec.email_password,
+                    rec.totp,
+                    args.manual,
+                    args.relogin,
+                )
+                print(f"{rec.username:20s} {'OK' if ok else 'FAILED'}: {msg}")
+
+
+def cmd_totp(cfg: Config, args: argparse.Namespace) -> None:
+    """Print a live, refreshing 2FA code for each account, for manual browser login."""
+    import pyotp
+
+    recs = [r for r, _ in read_accounts(args.file) if r and r.totp]
+    if args.usernames:
+        want = {u.lstrip("@").lower() for u in args.usernames}
+        recs = [r for r in recs if r.username.lower() in want]
+    if not recs:
+        print("No accounts with a TOTP secret found")
+        return
+
+    width = max(len(r.username) for r in recs)
+    header = "2FA codes (press Ctrl+C to stop)"
+    lines = len(recs) + 2
+    first = True
+    while True:
+        remaining = 30 - int(time.time()) % 30
+        rows = [header, "-" * len(header)]
+        for r in recs:
+            assert r.totp
+            rows.append(f"{r.username:<{width}}  {pyotp.TOTP(r.totp).now()}   {remaining:2d}s left")
+        if not first:
+            sys.stdout.write(f"\033[{lines}A")  # move cursor up to overwrite in place
+        sys.stdout.write("\033[J" + "\n".join(rows) + "\n")
+        sys.stdout.flush()
+        first = False
+        time.sleep(1)
 
 
 async def cmd_add_job(cfg: Config, args: argparse.Namespace) -> None:
@@ -131,6 +179,14 @@ async def cmd_status(cfg: Config, args: argparse.Namespace) -> None:
         if paused > now:
             print(f"PAUSED by circuit breaker for {_ago(paused, now)}\n")
 
+        proxy_status = {p.url: p.status for p in await store.proxies()}
+
+        def note(home: str | None, error: str | None) -> str:
+            down = home is not None and proxy_status.get(home, "removed") != "healthy"
+            if down and cfg.pin_home_proxy:
+                return f"waiting: home proxy {proxy_status.get(home or '', 'removed')}"
+            return (error or "")[:40]
+
         rows = [
             [
                 a.username,
@@ -141,7 +197,7 @@ async def cmd_status(cfg: Config, args: argparse.Namespace) -> None:
                 mask_proxy(a.home_proxy),
                 str(a.day_requests),
                 str(a.requests),
-                (a.last_error or "")[:40],
+                note(a.home_proxy, a.last_error),
             ]
             for a in await store.accounts()
         ]
@@ -223,8 +279,13 @@ def main() -> None:
     c = sub.add_parser("add-proxies", help="one proxy per line")
     c.add_argument("file")
 
-    c = sub.add_parser("add-accounts", help="one 'username|cookies' per line")
+    c = sub.add_parser(
+        "add-accounts",
+        help="'username|cookies' or 'username|password|email|email_password|totp' per line",
+    )
     c.add_argument("file")
+    c.add_argument("--manual", action="store_true", help="type X's email code yourself")
+    c.add_argument("--relogin", action="store_true", help="log in again even if the session works")
 
     c = sub.add_parser("add-job", help="queue a scraping job")
     c.add_argument("kind", choices=JOB_KINDS)
@@ -258,10 +319,18 @@ def main() -> None:
     c = sub.add_parser("run", help="start workers and the health monitor")
     c.add_argument("--minutes", type=float, help="stop after N minutes")
 
+    c = sub.add_parser("totp", help="print live 2FA codes for manual login")
+    c.add_argument("usernames", nargs="*", help="limit to these accounts")
+    c.add_argument("--file", default="accounts.txt", help="accounts file (default: accounts.txt)")
+
     args = p.parse_args()
     cfg = Config.load(args.config)
     if args.cmd == "config":
         print(cfg.dump())
+        return
+    if args.cmd == "totp":
+        with contextlib.suppress(KeyboardInterrupt):
+            cmd_totp(cfg, args)
         return
 
     handlers = {

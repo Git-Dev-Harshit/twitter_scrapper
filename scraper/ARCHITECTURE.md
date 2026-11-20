@@ -63,6 +63,9 @@ flowchart LR
 | `config.py` | Every tunable value, with defaults. Overridden by a JSON file passed with `--config`. |
 | `store.py` | SQLite schema, in-place upgrades, and queries: proxy/account health, jobs, sessions, events, tweets, users, matches, exports. |
 | `terms.py` | Reads the hashtag/keyword CSV and builds the X search queries. |
+| `accounts_file.py` | Parses the accounts file: cookie lines, password lines, and the colon-delimited Outlook bundle. |
+| `browser_login.py` | Optional, standalone. Logs accounts in through a real browser when X blocks the scripted flow. |
+| `outlook.py` | Reads the X email verification code from an Outlook mailbox over Microsoft Graph (used by `browser_login`). |
 | `policy.py` | Pure decision logic with no I/O: pair selection, cooldown and backoff maths, state transitions. Everything in it is unit-tested. |
 | `worker.py` | `PinnedPool`, `run_session` (one session), proxy probe, and classification of why twscrape stopped an account. |
 | `orchestrator.py` | Atomic leasing, applying outcomes, health monitor, circuit breaker, worker/monitor tasks. |
@@ -186,7 +189,7 @@ There are two pairing modes (`pairing` in config):
 
 | | `sticky` (default) | `rotate` |
 |---|---|---|
-| Rule | Each account has a home proxy and always uses it. It moves only when the home proxy fails (`cooldown`/`dead`). If the home proxy is just busy or resting, the account waits. | Every session picks the proxy this account used longest ago, or never used. |
+| Rule | Each account has a home proxy, chosen and probed when it's added. It logs in and scrapes only through that proxy. With `pin_home_proxy` (default `true`), an account whose home proxy is down waits for it: `status` shows `waiting: home proxy …`. Re-run `add-accounts` to move it to a new proxy and log in again there. With `pin_home_proxy: false`, it moves to the emptiest free proxy on its own. | Every session picks the proxy this account used longest ago, or never used. |
 | Accounts per IP | At most `max_accounts_per_proxy` (default 2) accounts call one proxy home. | Unbounded over time. |
 | What X sees | The same account, from the same IP, with the same browser fingerprint, day after day. That looks like a real person. | The same session cookie appearing from a new IP every few minutes, often a new country or ASN. That is one of the strongest account-takeover and bot signals there is. |
 
@@ -200,13 +203,14 @@ With sticky pairing the effective concurrency is `min(workers, accounts, proxies
 
 ```mermaid
 stateDiagram-v2
-    [*] --> healthy: add-accounts (cookies)
+    [*] --> healthy: add-accounts (cookies, or login via home proxy)
+    [*] --> expired: login failed
     healthy --> healthy: ok / rate_limited / proxy fault / error (rest = cooldown_until)
     healthy --> cooldown: soft_ban (strike +1, 6h x 2^(strikes-1))
     cooldown --> healthy: monitor, cooldown over (twscrape reactivated)
     healthy --> banned: banned, or strikes >= max_strikes
     healthy --> expired: cookies rejected
-    expired --> healthy: add-accounts with fresh cookies
+    expired --> healthy: add-accounts (fresh cookies or re-login)
     banned --> healthy: revive account (manual)
 ```
 
@@ -287,19 +291,62 @@ socks5://user:pass@5.6.7.8:1080
 9.9.9.9:8000:user:pass
 ```
 
-**accounts.txt**: `username|cookies`, one per line. Cookies can be a `Cookie` header string, a JSON object, a browser-extension JSON export, or base64 of any of these. `auth_token` and `ct0` are required.
+**accounts.txt**: one account per line (parsed by `accounts_file.py`), in any of three formats:
 
 ```
-alice|auth_token=...; ct0=...
-bob|{"auth_token": "...", "ct0": "..."}
+alice|auth_token=...; ct0=...                               # cookies copied from a browser
+bob|bobs_password|bob@example.com                           # password login, type email code yourself
+carol|carols_password|carol@gmail.com|gmail_app_password    # password login, code read over IMAP
+dave|daves_password|dave@example.com|_|BASE32TOTPSECRET     # with authenticator-app 2FA
+user:xpw:user@outlook.com:epw:M.C5...token:<guid>:TOTPSECRET  # Outlook OAuth bundle (vendor format)
 ```
 
-Both files contain credentials: keep them out of git.
+- **Cookies:** a `Cookie` header string, a JSON object, a browser-extension JSON export, or base64 of any of these. `auth_token` and `ct0` are required.
+- **Password login:** `username|password|email`, optionally followed by `|email_password` and `|totp_secret`. An empty or `_` email password means X's emailed code is typed in at the prompt. The TOTP secret is the base32 key shown when you set up the authenticator app, not a 6-digit code.
+- **Outlook OAuth bundle (colon-delimited):** the format accounts are often sold in — `username:password:email:email_password:<Microsoft OAuth refresh token>:<client-id GUID>:[recovery_email:]<TOTP secret>`. The parser takes the username, X password, email and the trailing TOTP secret. The mailbox behind these is reached through Microsoft OAuth, which twscrape's IMAP flow cannot drive, so email verification codes are always entered manually (run with `--manual`); the authenticator TOTP is still applied automatically. Detected by the `M.`-prefixed token and the GUID, so it is never confused with the pipe formats.
+- A password containing `|` can't be used in this file.
+
+Both files contain credentials. `proxies.txt` and `accounts.txt` are in `.gitignore`.
+
+#### How `add-accounts` handles each line
+
+1. **Pick a home proxy.** The account keeps its current home proxy if it isn't `dead`. Otherwise it gets the healthy proxy with the fewest accounts, on the /24 subnet with the fewest accounts (`policy.pick_home`). Neighbouring IPs look related, so accounts are spread across subnets.
+2. **Probe it.** If the probe fails, the proxy is benched and the next candidate is tried.
+3. **Log in or add cookies through that proxy.**
+   - A password line logs in through the home proxy (`twscrape.login`), and twscrape stores the resulting `auth_token`/`ct0` session cookies in `accounts.db`.
+   - A cookie line is stored as given.
+   - Either way, the proxy is also written to the account in `accounts.db`, so twscrape's own tools use it too.
+4. **Every scraping session for that account uses the same proxy** (§4, `pin_home_proxy`). Login IP, cookie IP and scraping IP are always the same.
+
+Re-running `add-accounts` is safe:
+- An account whose session still works is left alone (`already logged in`). Use `--relogin` to force a fresh login.
+- If the home proxy died, re-running moves the account to a new proxy and logs it in again there, so the cookies always belong to the IP that uses them.
+- `TWS_PROXY` must be unset, because it would override the home proxy. The command refuses to log in while it's set.
+
+#### When password login is blocked: `scraper.browser_login`
+
+X frequently refuses twscrape's scripted login with `error 366: flow name login is currently not accessible`, and may also serve `403` to automated clients on the login page. This is X blocking the login *API*, not a problem with the account, proxy or code — and no retry fixes it. The reliable answer is to log in through a **real browser** instead, which uses X's normal web flow.
+
+`scraper/browser_login.py` automates exactly that, so it still needs no manual cookie copying:
+
+```bash
+uv pip install playwright && uv run python -m playwright install chromium   # one-time, optional
+uv run python -m scraper.browser_login --config scraper.json                # auto, all accounts
+uv run python -m scraper.browser_login --config scraper.json --account alice # auto, one account
+uv run python -m scraper.browser_login --config scraper.json --assist        # you type, it captures
+```
+
+For each account it: picks and probes the home proxy (as above); launches a browser through that proxy — the user's real **Chrome** if present, with the `navigator.webdriver` automation flag hidden, so the session looks ordinary; types the username, then the password, then the verification code (TOTP from `pyotp`, or an emailed code read from the Outlook mailbox over Microsoft Graph with the bundle's OAuth token, `scraper/outlook.py` — no inbox access by hand). It then captures `auth_token`/`ct0` and saves them to the scraper, pinned to the proxy the login came from, so scraping reuses the same IP. The step is chosen by which field is on screen (`username_or_email` → `password` → `one-time-code`); the hidden `inert` password stub X puts on the first screen is filtered out so the code is never typed into the username box; and a "temporarily limited / suspicious" wall stops the run instead of retrying (retries extend the limit).
+
+**`--assist` mode** is the fallback when X flags the automated form-fill (it shows a "temporarily limited your login" wall to the automation even though a manual login on the same proxy works — the IP is fine, the bot behaviour is what's caught). In assist mode the tool opens the login page through the correct proxy and waits while **you** type the login in the window; human interaction passes the bot check. It prints the account's username, password and a live-refreshing 2FA code, polls for the session cookies, and saves them the moment they appear — so the proxy pinning and cookie capture stay automatic. `--wait` sets the minutes to wait per account (default 5).
+
+Playwright is **not** a scraper dependency; it is installed separately only to run this tool. Everything Playwright-independent in it (proxy parsing, the email-code extractor, the Graph calls) is unit-tested with mocks; the browser flow itself is not, because X's login markup shifts and the selectors need checking against the live page when it breaks. Caveats: it needs a display (both modes open a window); X can still challenge, throttle or lock a fresh account; and the Outlook OAuth token must still be valid and carry mail scope.
 
 ```bash
 uv run python -m scraper add-proxies proxies.txt
-uv run python -m scraper add-accounts accounts.txt
 uv run python -m scraper check-proxies                 # probe all now, see exit IPs
+uv run python -m scraper add-accounts accounts.txt     # --manual: always type email codes; --relogin
+uv run python -m scraper status                        # each account's home proxy
 uv run python -m scraper check-accounts                # optional: one request per account
 
 uv run python -m scraper import-csv terms.csv --lang en --every 60   # one search job per term (§3)
@@ -317,7 +364,7 @@ uv run python -m scraper revive account alice           # after you've fixed it 
 uv run python -m scraper revive proxy 1.2.3.4:8000
 ```
 
-Re-running `add-accounts` with fresh cookies updates the cookies and takes an `expired` account back to `healthy`. Running it again for a `banned` account updates the cookies but keeps the ban until you `revive` it.
+Re-running `add-accounts` with fresh cookies, or a password line, takes an `expired` account back to `healthy`. A `banned` account keeps its ban until you `revive` it.
 
 Only one `run` process may use a given `scraper.db` at a time. Leasing is atomic within one process, not across processes. On start-up, `run` clears `in_use` flags left over from a crash.
 
@@ -360,6 +407,7 @@ SELECT * FROM events WHERE kind IN ('banned','soft_ban','breaker') ORDER BY ts D
 | `idle_poll_seconds` | [10, 30] | Worker back-off when nothing can be leased. |
 | `pairing` | `sticky` | `sticky` or `rotate` (see §4). |
 | `max_accounts_per_proxy` | 2 | Sticky mode: accounts sharing one home proxy. |
+| `pin_home_proxy` | `true` | Sticky mode: an account only ever uses its home proxy, and waits when it's down. `false` lets it move to another proxy on its own. |
 | `error_cooldown_minutes` | 5 | Account pause after an unclassified error. |
 | `soft_ban_cooldown_hours` | 6 | First soft-ban cooldown, doubled per strike. |
 | `max_strikes` | 3 | Soft bans before an account is retired as `banned`. |
@@ -380,7 +428,9 @@ SELECT * FROM events WHERE kind IN ('banned','soft_ban','breaker') ORDER BY ts D
 | Many `rate_limited` | Too much volume per account. | Lower `session_max_pages` or `daily_request_cap`, raise `page_delay_seconds`. |
 | `soft_ban` on several accounts on the same proxy | That IP is flagged. | Check `sessions` for the common proxy, replace it. |
 | `soft_ban` across many proxies | Volume or query pattern, or X changed something. | Let the breaker pause run, then lower volume. |
-| `expired` | Cookies invalidated (password change, logout, X security check). | Log in from the same IP in a browser, export cookies, `add-accounts`. |
+| `expired` | Cookies invalidated (password change, logout, X security check), or login failed. | Run `add-accounts` again with the password line: it logs in again through the same home proxy. For cookie accounts, log in from that proxy's IP in a browser, export the cookies, and run `add-accounts`. |
+| `waiting: home proxy cooldown/dead` | The account's pinned proxy is down. | Wait for the monitor to recover it, or re-run `add-accounts` to move the account to a new proxy. |
+| Login `FAILED: … ct0 not in cookies` | X refused the login from that IP, or asked for a challenge twscrape can't solve. | Log in once in a normal browser through the same proxy, then use the cookie line instead. |
 | Proxies flapping `cooldown` | Unstable provider. | Check latency in `status`. Replace the proxy, or raise `proxy_check_timeout`. |
 | "Proxies share exit IP" warning | Gateway proxy or duplicate entries. | Use distinct sticky IPs. |
 | `proxy_blocked` | Cloudflare/X block page for that IP. | Replace the proxy (usually a datacenter range). |

@@ -125,6 +125,29 @@ CREATE TABLE IF NOT EXISTS matches (
     PRIMARY KEY (tweet_id, job_id)
 );
 CREATE INDEX IF NOT EXISTS matches_job ON matches(job_id);
+
+-- Ready-to-query views for live inspection (SELECT * FROM leads / progress).
+CREATE VIEW IF NOT EXISTS leads AS
+SELECT u.username, u.displayname, u.followers, u.following, u.statuses,
+    u.location, u.website, u.bio, u.links, u.profile_url, u.verified, u.blue, u.created,
+    COUNT(DISTINCT CASE WHEN t.is_retweet = 0 THEN t.id END) AS matched_tweets,
+    COUNT(DISTINCT CASE WHEN t.is_retweet = 1 THEN t.id END) AS matched_retweets,
+    GROUP_CONCAT(DISTINCT COALESCE(j.label, j.target)) AS matched_terms,
+    MAX(t.date) AS last_matched_at
+FROM matches m
+JOIN tweets t ON t.id = m.tweet_id
+JOIN users u ON u.id = t.user_id
+JOIN jobs j ON j.id = m.job_id
+GROUP BY u.id
+ORDER BY matched_tweets + matched_retweets DESC, u.followers DESC;
+
+CREATE VIEW IF NOT EXISTS progress AS
+SELECT COALESCE(j.label, j.target) AS term, j.source, j.status, j.items AS new_matches,
+    COUNT(DISTINCT m.tweet_id) AS total_matched, j.last_error
+FROM jobs j
+LEFT JOIN matches m ON m.job_id = j.id
+GROUP BY j.id
+ORDER BY total_matched DESC;
 """
 
 # Columns added after the first release. Applied when missing, so old databases upgrade

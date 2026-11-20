@@ -7,15 +7,19 @@ from typing import Any
 
 import pytest
 
+import scraper.orchestrator as orchestrator_mod
+from scraper.accounts_file import AccountFileError, parse_line, read_accounts
 from scraper.config import Config
 from scraper.orchestrator import Orchestrator, mask_proxy
 from scraper.policy import (
     SessionResult,
     account_after,
     choose_pair,
+    pick_home,
     proxies_to_probe,
     proxy_after,
     proxy_after_probe,
+    subnet,
     utc_day,
 )
 from scraper.store import AccountState, PairStats, ProxyState, Store
@@ -23,8 +27,9 @@ from scraper.terms import build_query, read_terms
 from scraper.worker import ProbeResult, bottom_cursor, classify_account, run_session
 from twscrape import API, AccountsPool, NoAccountError
 from twscrape.account import Account
+from twscrape.login import LoginConfig
 from twscrape.models import parse_tweets
-from twscrape.utils import utc
+from twscrape.utils import parse_proxy, utc
 
 DATA_DIR = Path(__file__).parent / "mocked-data"
 NOW = 1_800_000_000.0
@@ -55,13 +60,33 @@ def test_sticky_waits_for_busy_home_instead_of_hopping():
     assert choose_pair(accs, pxs, {}, cfg, NOW, rng()) is None
 
 
-def test_sticky_migrates_when_home_proxy_fails():
-    cfg = Config()
+def test_pinned_account_waits_for_its_home_proxy():
+    cfg = Config()  # pin_home_proxy is on by default
+    accs = [AccountState("a", home_proxy=P1)]
+    for status in ("cooldown", "dead"):
+        pxs = [ProxyState(P1, status=status, cooldown_until=NOW + 60), ProxyState(P2)]
+        assert choose_pair(accs, pxs, {}, cfg, NOW, rng()) is None
+
+
+def test_unpinned_account_migrates_when_home_proxy_fails():
+    cfg = Config(pin_home_proxy=False)
     accs = [AccountState("a", home_proxy=P1)]
     pxs = [ProxyState(P1, status="cooldown", cooldown_until=NOW + 60), ProxyState(P2)]
     pick = choose_pair(accs, pxs, {}, cfg, NOW, rng())
     assert pick is not None
     assert pick[1].url == P2 and pick[2] is True
+
+
+def test_new_home_spreads_accounts_across_subnets():
+    cfg = Config(max_accounts_per_proxy=1)
+    same_a, same_b = "1.1.1.10:8000:u:p", "1.1.1.20:8000:u:p"
+    other = "2.2.2.10:8000:u:p"
+    accs = [AccountState("a", home_proxy=same_a), AccountState("b")]
+    pxs = [ProxyState(same_a), ProxyState(same_b), ProxyState(other)]
+    for seed in range(20):
+        pick = pick_home("b", accs, pxs, {}, cfg, random.Random(seed))
+        assert pick is not None and pick.url == other  # 1.1.1.x already has "a"
+    assert subnet(same_a) == subnet("http://u:p@1.1.1.99:1") == "1.1.1"
 
 
 def test_sticky_limits_accounts_per_proxy():
@@ -504,3 +529,260 @@ async def test_old_database_is_upgraded(tmp_path: Path):
         assert jobs[0].target == "old" and jobs[0].source == "manual"
         cols = {r["name"] for r in await store._all("PRAGMA table_info(users)")}
         assert {"bio", "website", "links", "profile_url"} <= cols
+
+
+# onboarding: home proxy first, then cookies or login through it
+
+
+@pytest.fixture
+def fake_login(monkeypatch):
+    calls: list[tuple[str, str | None, bool]] = []
+
+    async def login(acc: Account, cfg: LoginConfig | None = None) -> Account:
+        calls.append((acc.username, acc.resolve_proxy(), bool(cfg and cfg.manual)))
+        acc.active = True
+        acc.cookies = {"auth_token": "t", "ct0": "c"}
+        return acc
+
+    monkeypatch.setattr(orchestrator_mod, "tw_login", login)
+    monkeypatch.delenv("TWS_PROXY", raising=False)
+    return calls
+
+
+async def test_login_goes_through_home_proxy_and_scraping_reuses_it(env, fake_login):
+    cfg, store, pool = env
+    orc = _orc(cfg, store, pool, FakeAPI([]), Clock())
+
+    ok, msg = await orc.login_account("alice", "pw", "a@example.com", "_")
+    assert ok, msg
+    state = await store.account("alice")
+    assert state is not None and state.home_proxy in (P1, P2)
+    home = state.home_proxy or ""
+
+    # login ran through the home proxy, with manual email codes (no email password given)
+    assert fake_login == [("alice", parse_proxy(home), True)]
+    acc = await pool.get("alice")
+    assert acc.active and acc.has_session and acc.proxy == home
+
+    # a working session is kept, not logged in again
+    ok, msg = await orc.login_account("alice", "pw", "a@example.com", "_")
+    assert ok and "already" in msg and len(fake_login) == 1
+
+    # every scraping session for alice uses that same proxy
+    await store.add_job("search", "python")
+    for a in await store.accounts():
+        if a.username != "alice":
+            await store.save_account(replace(a, status="banned"))
+    lease = await orc.acquire()
+    assert lease is not None and lease.account.username == "alice" and lease.proxy.url == home
+
+
+async def test_login_skips_proxy_that_fails_probe(env, fake_login):
+    cfg, store, pool = env
+    probed: list[str] = []
+
+    async def probe(url: str) -> ProbeResult:
+        probed.append(url)
+        return ProbeResult(url != P1, 50, "9.9.9.9", None if url != P1 else "timeout")
+
+    orc = _orc(cfg, store, pool, FakeAPI([]), Clock())
+    orc.probe = probe
+    ok, _ = await orc.login_account("alice", "pw", "a@example.com", "mailpw")
+
+    assert ok
+    assert fake_login[0][1] == parse_proxy(P2) and fake_login[0][2] is False
+    state = await store.account("alice")
+    assert state is not None and state.home_proxy == P2
+    proxies = {p.url: p for p in await store.proxies()}
+    if P1 in probed:
+        assert proxies[P1].status == "cooldown"
+
+
+async def test_failed_login_marks_account_expired(env, monkeypatch):
+    cfg, store, pool = env
+
+    async def login(acc: Account, cfg: LoginConfig | None = None) -> Account:
+        raise AssertionError("ct0 not in cookies (most likely ip ban)")
+
+    monkeypatch.setattr(orchestrator_mod, "tw_login", login)
+    monkeypatch.delenv("TWS_PROXY", raising=False)
+    orc = _orc(cfg, store, pool, FakeAPI([]), Clock())
+
+    ok, msg = await orc.login_account("alice", "pw", "a@example.com", "_")
+    assert not ok and "ct0" in msg
+    state = await store.account("alice")
+    assert state is not None and state.status == "expired"
+    acc = await pool.get("alice")
+    assert not acc.active and (acc.error_msg or "").startswith("login failed")
+
+
+async def test_login_refuses_global_proxy_override(env, fake_login, monkeypatch):
+    cfg, store, pool = env
+    monkeypatch.setenv("TWS_PROXY", "http://other:1")
+    orc = _orc(cfg, store, pool, FakeAPI([]), Clock())
+    ok, msg = await orc.login_account("alice", "pw", "a@example.com", "_")
+    assert not ok and "TWS_PROXY" in msg and fake_login == []
+
+
+async def test_cookie_account_gets_home_proxy_in_both_databases(env):
+    cfg, store, pool = env
+    orc = _orc(cfg, store, pool, FakeAPI([]), Clock())
+    proxy = await orc.add_cookie_account("bob", "auth_token=a; ct0=b")
+    state = await store.account("bob")
+    assert state is not None and state.home_proxy == proxy.url
+    assert (await pool.get("bob")).proxy == proxy.url
+
+
+async def test_sync_adopts_proxy_set_in_twscrape(env):
+    cfg, store, pool = env
+    acc = await pool.get("user1")
+    acc.proxy = "2.2.2.2:8000:u:p"  # same proxy as P2, written differently
+    await pool.save(acc)
+    orc = _orc(cfg, store, pool, FakeAPI([]), Clock())
+    await orc.sync_accounts()
+    state = await store.account("user1")
+    assert state is not None and state.home_proxy == P2
+
+
+# accounts file parsing (synthetic data, no real secrets)
+
+
+def test_parse_pipe_cookie_and_login_lines():
+    rec = parse_line("alice|auth_token=t; ct0=c")
+    assert rec.kind == "cookies" and rec.username == "alice"
+
+    rec = parse_line("@bob|secret|bob@example.com")
+    assert rec.kind == "login" and rec.username == "bob"
+    assert rec.password == "secret" and rec.email_password == "_" and rec.totp is None
+
+    rec = parse_line("carol|pw|carol@gmail.com|mailpw|ABCDEFGHIJKLMNOP")
+    assert rec.email_password == "mailpw" and rec.totp == "ABCDEFGHIJKLMNOP"
+
+
+def test_parse_pipe_rejects_bad_lines():
+    for bad in ["alice|auth_token=only", "bob|pw|notanemail", "x|a|b|c|d|e"]:
+        with pytest.raises(AccountFileError):
+            parse_line(bad)
+
+
+def test_parse_outlook_bundle():
+    token = "M.C550_BAY.0.U.MsaArtifacts.-AbC" + "x" * 40
+    guid = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+    # username:password:email:email_pw:oauth_token:client_id:totp
+    rec = parse_line(f"user1:xpass@@@:user1mail@outlook.com:epw:{token}:{guid}:KK2PXK73ZLRXUAKO")
+    assert rec.kind == "login" and rec.username == "user1"
+    assert rec.password == "xpass@@@" and rec.email == "user1mail@outlook.com"
+    assert rec.totp == "KK2PXK73ZLRXUAKO"
+    assert rec.email_password == "_"  # Outlook OAuth mailbox: codes are manual
+
+    # with a recovery email before the TOTP (8 fields)
+    rec = parse_line(
+        f"user2:p:user2@outlook.fr:ep:{token}:{guid}:recovery@inbox.com:DPBOIHFGTQSBY6J5"
+    )
+    assert rec.totp == "DPBOIHFGTQSBY6J5" and rec.email == "user2@outlook.fr"
+
+
+def test_read_accounts_mixed_and_invalid(tmp_path: Path):
+    token = "M.C505_BAY.0.U.MsaArtifacts.-Zz" + "y" * 30
+    guid = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+    f = tmp_path / "accounts.txt"
+    f.write_text(
+        "\n".join(
+            [
+                "# a comment",
+                "",
+                "alice|auth_token=t; ct0=c",
+                f"vuser:vp:vuser@outlook.com:ep:{token}:{guid}:ABCDEFGHIJKLMNOP",
+                "garbage line with no delimiters",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    recs = read_accounts(f)
+    assert len(recs) == 3
+    assert recs[0][0] is not None and recs[0][0].kind == "cookies"
+    assert recs[1][0] is not None and recs[1][0].totp == "ABCDEFGHIJKLMNOP"
+    assert recs[2][0] is None  # garbage reported, not crashing
+
+
+# browser-login helpers (no network, no Playwright)
+
+
+def test_vendor_bundle_keeps_oauth_fields():
+    token = "M.C550_BAY.0.U.MsaArtifacts.-AbC" + "x" * 40
+    guid = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+    rec = parse_line(f"u:p:u@outlook.com:ep:{token}:{guid}:KK2PXK73ZLRXUAKO")
+    assert rec.oauth_token == token and rec.oauth_client_id == guid
+
+
+def test_pw_proxy_parses_all_forms():
+    from scraper.browser_login import pw_proxy
+
+    want = {"server": "http://1.2.3.4:8000", "username": "u", "password": "p"}
+    assert pw_proxy("1.2.3.4:8000:u:p") == want
+    assert pw_proxy("http://u:p@1.2.3.4:8000") == want
+    assert pw_proxy("1.2.3.4:8000") == {"server": "http://1.2.3.4:8000"}
+
+
+@pytest.mark.parametrize(
+    "subject, body, expected",
+    [
+        ("", "Your X confirmation code is abc12345", "abc12345"),
+        ("Your verification code is 483920", "", "483920"),
+        ("837261 is your X login code", "", "837261"),
+        ("Welcome to X", "nothing useful here", None),
+    ],
+)
+def test_extract_code(subject, body, expected):
+    from scraper import outlook
+
+    assert outlook.extract_code(subject, body) == expected
+
+
+def test_outlook_token_and_latest_code_with_mock():
+    import httpx
+
+    from scraper import outlook
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/token"):
+            assert b"grant_type=refresh_token" in request.content
+            return httpx.Response(200, json={"access_token": "AT"})
+        assert request.headers["Authorization"] == "Bearer AT"
+        return httpx.Response(
+            200,
+            json={
+                "value": [
+                    {
+                        "from": {"emailAddress": {"address": "noreply@other.com"}},
+                        "subject": "code 999999",
+                        "bodyPreview": "",
+                        "receivedDateTime": "",
+                    },
+                    {
+                        "from": {"emailAddress": {"address": "info@x.com"}},
+                        "subject": "Your X confirmation code is zxy98765",
+                        "bodyPreview": "",
+                        "receivedDateTime": "",
+                    },
+                ]
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    token = outlook.get_access_token("rt", "cid", client)
+    assert token == "AT"
+    # the non-X sender is skipped, the X one is used
+    assert outlook.latest_code(token, client) == "zxy98765"
+
+
+def test_outlook_token_error_is_raised():
+    import httpx
+
+    from scraper import outlook
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(400, text="invalid_grant"))
+    )
+    with pytest.raises(outlook.OutlookError):
+        outlook.get_access_token("rt", "cid", client)

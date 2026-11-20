@@ -8,6 +8,9 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Literal
+from urllib.parse import urlparse
+
+from twscrape.utils import parse_proxy
 
 from .config import Config, Range
 from .store import AccountState, PairStats, ProxyState
@@ -60,6 +63,44 @@ def proxy_available(p: ProxyState, now: float) -> bool:
     return p.status == "healthy" and not p.in_use and p.cooldown_until <= now
 
 
+def subnet(url: str) -> str:
+    """The /24 of an IPv4 proxy host (accounts on one /24 look related), else the host."""
+    host = urlparse(parse_proxy(url) or url).hostname or url
+    parts = host.split(".")
+    if len(parts) == 4 and all(x.isdigit() for x in parts):
+        return ".".join(parts[:3])
+    return host
+
+
+def pick_home(
+    username: str,
+    accounts: list[AccountState],
+    candidates: list[ProxyState],
+    history: dict[tuple[str, str], PairStats],
+    cfg: Config,
+    rng: random.Random,
+) -> ProxyState | None:
+    """Best new home proxy for an account: the emptiest IP on the emptiest subnet.
+
+    Never a proxy already holding max_accounts_per_proxy other accounts, and never one this
+    account was banned on.
+    """
+    others = [
+        a for a in accounts if a.username != username and a.home_proxy and a.status != "banned"
+    ]
+    bound = Counter(a.home_proxy for a in others)
+    subnets = Counter(subnet(a.home_proxy or "") for a in others)
+    options = [
+        p
+        for p in candidates
+        if bound[p.url] < cfg.max_accounts_per_proxy
+        and history.get((username, p.url), _NO_STATS).bans == 0
+    ]
+    if not options:
+        return None
+    return min(options, key=lambda p: (bound[p.url], subnets[subnet(p.url)], rng.random()))
+
+
 def choose_pair(
     accounts: list[AccountState],
     proxies: list[ProxyState],
@@ -74,9 +115,6 @@ def choose_pair(
     if not free:
         return None
 
-    # how many live accounts call each proxy home: keeps few accounts behind one IP
-    bound = Counter(a.home_proxy for a in accounts if a.home_proxy and a.status != "banned")
-
     # least recently used account first, with jitter so the order is never a fixed cycle
     candidates = [a for a in accounts if account_available(a, now, cfg)]
     candidates.sort(key=lambda a: a.last_used + rng.uniform(0, 300))
@@ -84,21 +122,19 @@ def choose_pair(
     for acc in candidates:
         home = by_url.get(acc.home_proxy) if acc.home_proxy else None
 
-        if cfg.pairing == "sticky" and home is not None and home.status == "healthy":
-            if proxy_available(home, now):
-                return acc, home, False
-            continue  # home IP busy or resting: wait for it instead of hopping IPs
+        if cfg.pairing == "sticky":
+            if home is not None and (home.status == "healthy" or cfg.pin_home_proxy):
+                if proxy_available(home, now):
+                    return acc, home, False
+                continue  # home IP busy, resting or (pinned) down: wait, never hop IPs
+
+            pick = pick_home(acc.username, accounts, free, history, cfg, rng)
+            if pick is None:
+                continue
+            return acc, pick, True
 
         # never reuse a combination that ended in a ban
         options = [p for p in free if history.get((acc.username, p.url), _NO_STATS).bans == 0]
-
-        if cfg.pairing == "sticky":
-            options = [p for p in options if bound[p.url] < cfg.max_accounts_per_proxy]
-            if not options:
-                continue
-            pick = min(options, key=lambda p: (bound[p.url], rng.random()))
-            return acc, pick, True
-
         if not options:
             continue
         # rotate: the combination used longest ago (or never) wins

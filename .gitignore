@@ -13,3 +13,10 @@ results-raw/
 scraper.db*
 /users.csv
 /tweets.csv
+proxies.txt
+accounts.txt
+
+# local run config
+scraper.json
+browser_login_debug/
+cookies.txt
